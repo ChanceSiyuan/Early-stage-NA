@@ -1,0 +1,14 @@
+# LaTeX
+*.aux
+*.log
+*.out
+*.pdf
+*.gz
+*.fls
+*.fdb_latexmk
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
