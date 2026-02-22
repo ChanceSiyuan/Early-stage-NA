@@ -6,6 +6,8 @@ This module provides the high-level simulation workflow:
 - Backend-aware transpilation and execution via Qiskit Aer
 - Unified ``run_simulation`` entry point returning both unmitigated
   and mitigated expectation values
+- Hybrid analog-digital interface: statevector/density-matrix handoff
+  from analog backends into the digital B^(2) measurement layer
 
 All noisy simulations use **Pauli-only noise models** processed through
 Monte Carlo trajectory sampling, avoiding density-matrix memory walls
@@ -333,4 +335,254 @@ def run_simulation(
         "mitigated_z": mitigated_z,
         "tr_rho_sq": mean_den,
         "shots": shots,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Statevector-initialized circuit builders (analog-digital handoff)
+# ---------------------------------------------------------------------------
+
+def build_m2_circuit_from_statevector(
+    statevector: np.ndarray,
+    n_qubits: int | None = None,
+) -> QuantumCircuit:
+    """Build the M=2 protocol circuit initialized from a statevector.
+
+    Instead of applying a gate-based state-preparation circuit, both copies
+    are initialized directly from *statevector* via ``qc.initialize()``.
+    The B^(2) measurement layer and final measurements are identical to
+    :func:`build_m2_circuit`.
+
+    Args:
+        statevector: Complex amplitude vector of length ``2^N`` in Qiskit
+            convention.
+        n_qubits: Number of logical qubits *N*.  Inferred from
+            ``len(statevector)`` when not provided.
+
+    Returns:
+        A 2N-qubit circuit with measurements on all qubits.
+    """
+    n = n_qubits if n_qubits is not None else int(np.log2(len(statevector)))
+    qc = QuantumCircuit(2 * n, 2 * n, name="m2_from_sv")
+
+    qc.initialize(statevector, qubits=list(range(n)))
+    qc.initialize(statevector, qubits=list(range(n, 2 * n)))
+
+    qc.barrier()
+    for i in range(n):
+        apply_b2_gate(qc, i, n + i)
+    qc.barrier()
+
+    qc.measure(list(range(2 * n)), list(range(2 * n)))
+    return qc
+
+
+def build_single_copy_circuit_from_statevector(
+    statevector: np.ndarray,
+    n_qubits: int | None = None,
+) -> QuantumCircuit:
+    """Build a single-copy measurement circuit initialized from a statevector.
+
+    Used for computing the unmitigated ``<Z_k>`` baseline when the state
+    comes from an analog evolution rather than a gate circuit.
+
+    Args:
+        statevector: Complex amplitude vector of length ``2^N``.
+        n_qubits: Number of logical qubits *N*.
+
+    Returns:
+        An N-qubit circuit with measurements on all qubits.
+    """
+    n = n_qubits if n_qubits is not None else int(np.log2(len(statevector)))
+    qc = QuantumCircuit(n, n, name="single_from_sv")
+    qc.initialize(statevector, qubits=list(range(n)))
+    qc.measure(list(range(n)), list(range(n)))
+    return qc
+
+
+def build_subsystem_m2_circuit_from_statevector(
+    statevector: np.ndarray,
+    n_qubits: int | None = None,
+    subsystem: list[int] | None = None,
+) -> QuantumCircuit:
+    """Build M=2 circuit with B^(2) applied only to subsystem qubit pairs.
+
+    Layout identical to :func:`build_m2_circuit_from_statevector`:
+    qubits 0..N-1 are copy 1, qubits N..2N-1 are copy 2.  B^(2) is
+    applied to pairs ``(j, N+j)`` only for ``j in subsystem``.  All 2N
+    qubits are measured in the computational basis.
+
+    Args:
+        statevector: Complex amplitude vector of length ``2^N``.
+        n_qubits: Number of logical qubits *N*.  Inferred from
+            ``len(statevector)`` when not provided.
+        subsystem: Qubit indices for subsystem A.  If ``None``, applies
+            B^(2) to all pairs (equivalent to
+            :func:`build_m2_circuit_from_statevector`).
+
+    Returns:
+        A 2N-qubit circuit with measurements on all qubits.
+    """
+    n = n_qubits if n_qubits is not None else int(np.log2(len(statevector)))
+    qc = QuantumCircuit(2 * n, 2 * n, name="subsystem_m2_from_sv")
+
+    qc.initialize(statevector, qubits=list(range(n)))
+    qc.initialize(statevector, qubits=list(range(n, 2 * n)))
+
+    qc.barrier()
+    indices = subsystem if subsystem is not None else list(range(n))
+    for i in indices:
+        apply_b2_gate(qc, i, n + i)
+    qc.barrier()
+
+    qc.measure(list(range(2 * n)), list(range(2 * n)))
+    return qc
+
+
+# ---------------------------------------------------------------------------
+# Analog-digital simulation runner
+# ---------------------------------------------------------------------------
+
+def run_analog_digital_simulation(
+    analog_result,
+    noise_model: NoiseModel | None = None,
+    shots: int = 10_000,
+    observable_qubit: int = 0,
+    seed: int | None = None,
+) -> dict:
+    """Run the M=2 Virtual Distillation workflow from an analog-evolved state.
+
+    Two modes depending on the content of *analog_result*:
+
+    1. **Pure state** (``statevector`` is not None): Initialize both copies
+       from the statevector, apply B^(2) + measurement, run on
+       ``AerSimulator(method='statevector')``.  The optional *noise_model*
+       applies to the digital B^(2) gates only.
+
+    2. **Mixed state** (``density_matrix`` is not None): Eigendecompose
+       the density matrix into ``rho = sum_i p_i |psi_i><psi_i|``.  For
+       each eigenvector with non-negligible weight, run the pure-state M=2
+       pipeline and compute a weighted average of the results.
+
+    Args:
+        analog_result: An ``AnalogEvolutionResult`` from ``src.analog``.
+        noise_model: Qiskit ``NoiseModel`` for the digital layer, or
+            ``None`` for noiseless B^(2) gates.
+        shots: Number of measurement shots (per trajectory for mixed states).
+        observable_qubit: Logical qubit for the Z expectation value.
+        seed: Random seed.
+
+    Returns:
+        A dictionary matching the format of :func:`run_simulation` with an
+        additional ``'source': 'analog_digital'`` key.
+    """
+    n_qubits = analog_result.n_qubits
+
+    if analog_result.statevector is not None:
+        return _run_pure_state_path(
+            analog_result.statevector, n_qubits,
+            noise_model, shots, observable_qubit, seed,
+        )
+    elif analog_result.density_matrix is not None:
+        return _run_mixed_state_path(
+            analog_result.density_matrix, n_qubits,
+            noise_model, shots, observable_qubit, seed,
+        )
+    else:
+        raise ValueError(
+            "AnalogEvolutionResult has neither statevector nor density_matrix."
+        )
+
+
+def _run_pure_state_path(
+    statevector: np.ndarray,
+    n_qubits: int,
+    noise_model: NoiseModel | None,
+    shots: int,
+    observable_qubit: int,
+    seed: int | None,
+) -> dict:
+    """M=2 pipeline from a pure statevector."""
+    backend_kwargs: dict = {"method": "statevector"}
+    if noise_model is not None:
+        backend_kwargs["noise_model"] = noise_model
+    backend = AerSimulator(**backend_kwargs)
+
+    # Unmitigated
+    single_circ = build_single_copy_circuit_from_statevector(statevector, n_qubits)
+    job_single = backend.run(single_circ, shots=shots, seed_simulator=seed)
+    counts_single = job_single.result().get_counts()
+    unmitigated_z = compute_unmitigated_expval(counts_single, observable_qubit)
+
+    # Mitigated (M=2)
+    m2_circ = build_m2_circuit_from_statevector(statevector, n_qubits)
+    job_m2 = backend.run(m2_circ, shots=shots, seed_simulator=seed)
+    counts_m2 = job_m2.result().get_counts()
+    mitigated_z, _num, mean_den = compute_mitigated_expval(
+        counts_m2, observable_qubit, n_qubits,
+    )
+
+    return {
+        "method": "statevector",
+        "n_qubits": n_qubits,
+        "unmitigated_z": unmitigated_z,
+        "mitigated_z": mitigated_z,
+        "tr_rho_sq": mean_den,
+        "shots": shots,
+        "source": "analog_digital",
+    }
+
+
+def _run_mixed_state_path(
+    density_matrix: np.ndarray,
+    n_qubits: int,
+    noise_model: NoiseModel | None,
+    shots: int,
+    observable_qubit: int,
+    seed: int | None,
+) -> dict:
+    """M=2 pipeline from a density matrix via eigendecomposition.
+
+    Decomposes ``rho = sum_i p_i |psi_i><psi_i|`` and runs the pure-state
+    path for each eigenvector with ``p_i > threshold``, then computes a
+    weighted average.
+    """
+    eigenvalues, eigenvectors = np.linalg.eigh(density_matrix)
+
+    # Filter negligible eigenvalues
+    threshold = 1e-8
+    mask = eigenvalues > threshold
+    weights = eigenvalues[mask]
+    states = eigenvectors[:, mask]  # columns are eigenvectors
+
+    # Normalize weights
+    weights = weights / weights.sum()
+
+    weighted_unmit = 0.0
+    weighted_mit = 0.0
+    weighted_tr_rho2 = 0.0
+
+    rng = np.random.default_rng(seed)
+
+    for i in range(len(weights)):
+        psi = states[:, i]
+        traj_seed = int(rng.integers(0, 2**31))
+
+        result_i = _run_pure_state_path(
+            psi, n_qubits, noise_model, shots, observable_qubit, traj_seed,
+        )
+
+        weighted_unmit += weights[i] * result_i["unmitigated_z"]
+        weighted_mit += weights[i] * result_i["mitigated_z"]
+        weighted_tr_rho2 += weights[i] * result_i["tr_rho_sq"]
+
+    return {
+        "method": "statevector",
+        "n_qubits": n_qubits,
+        "unmitigated_z": weighted_unmit,
+        "mitigated_z": weighted_mit,
+        "tr_rho_sq": weighted_tr_rho2,
+        "shots": shots,
+        "source": "analog_digital",
+        "n_trajectories": len(weights),
     }

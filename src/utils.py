@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 from qiskit.circuit import QuantumCircuit
-from qiskit_aer.noise import NoiseModel, depolarizing_error, pauli_error
+from qiskit_aer.noise import NoiseModel, ReadoutError, depolarizing_error, pauli_error
 
 
 # ---------------------------------------------------------------------------
@@ -26,25 +26,20 @@ from qiskit_aer.noise import NoiseModel, depolarizing_error, pauli_error
 # ---------------------------------------------------------------------------
 
 def apply_b2_gate(circuit: QuantumCircuit, q_copy1: int, q_copy2: int) -> None:
-    """Append the M=2 beamsplitter gate B^(2) between a qubit pair.
+    """Append the M=2 beamsplitter gate B^(2)† between a qubit pair.
 
-    The B^(2) gate diagonalizes the 2-qubit SWAP operator in the
-    computational basis.  Its unitary is::
-
-        B^(2) = |00><00|
-              + (|01> + |10>)(<01| / sqrt2)
-              + (-|01> + |10>)(<10| / sqrt2)
-              + |11><11|
+    The VD protocol requires B^(2)† (the *inverse* of the SWAP-diagonalizing
+    unitary) so that symmetric input states map to the SWAP +1 eigenspace
+    in the measurement basis.  The forward transform B^(2) diagonalizes
+    SWAP as ``B†·SWAP·B = diag(1, 1, -1, 1)``; applying B† in the circuit
+    ensures ``E[D] = Tr(ρ²)`` for any state ρ.
 
     Decomposition into native gates (4 CX + 2 Ry)::
 
-        CNOT(q1 -> q2)  -->  CRy(-pi/2, ctrl=q2, tgt=q1)  -->  CNOT(q1 -> q2)
+        CNOT(q1 -> q2)  -->  CRy(+pi/2, ctrl=q2, tgt=q1)  -->  CNOT(q1 -> q2)
 
-    Each B^(2) contributes approximately 2 non-Clifford gates when transpiled
+    Each B^(2)† contributes approximately 2 non-Clifford gates when transpiled
     to the Clifford+T basis (relevant for the extended_stabilizer backend).
-
-    CRITICAL: the CRy angle must be **-pi/2** (negative). Using +pi/2
-    transposes the off-diagonal signs and breaks SWAP diagonalization.
 
     Args:
         circuit: Quantum circuit to modify in-place.
@@ -52,8 +47,7 @@ def apply_b2_gate(circuit: QuantumCircuit, q_copy1: int, q_copy2: int) -> None:
         q_copy2: Qubit index belonging to copy 2.
     """
     circuit.cx(q_copy1, q_copy2)
-    # CRy(-pi/2) decomposes internally into 2 CX + 2 Ry(+/-pi/4)
-    circuit.cry(-np.pi / 2, q_copy2, q_copy1)
+    circuit.cry(np.pi / 2, q_copy2, q_copy1)
     circuit.cx(q_copy1, q_copy2)
 
 
@@ -76,6 +70,7 @@ def get_pauli_noise_model(
     p_1q: float,
     p_2q: float,
     noise_type: str = "depolarizing",
+    p_readout: float = 0.0,
 ) -> NoiseModel:
     """Build a Pauli-only noise model for trajectory-based simulation.
 
@@ -108,6 +103,9 @@ def get_pauli_noise_model(
         p_2q: Error probability for two-qubit gates (must be in [0, 1]).
         noise_type: One of ``'depolarizing'``, ``'bit_flip'``,
             ``'phase_flip'``, ``'bit_phase_flip'``.
+        p_readout: Symmetric readout (SPAM) error probability. When non-zero,
+            a symmetric bit-flip readout error is added to every qubit:
+            P(0|1) = P(1|0) = p_readout.
 
     Returns:
         A :class:`~qiskit_aer.noise.NoiseModel` ready to pass to
@@ -121,6 +119,8 @@ def get_pauli_noise_model(
         raise ValueError(f"p_1q must be in [0, 1], got {p_1q}")
     if not (0 <= p_2q <= 1):
         raise ValueError(f"p_2q must be in [0, 1], got {p_2q}")
+    if not (0 <= p_readout <= 0.5):
+        raise ValueError(f"p_readout must be in [0, 0.5], got {p_readout}")
 
     if noise_type == "depolarizing":
         error_1q = depolarizing_error(p_1q, 1)
@@ -143,6 +143,12 @@ def get_pauli_noise_model(
     noise_model = NoiseModel()
     noise_model.add_all_qubit_quantum_error(error_1q, _SINGLE_QUBIT_GATES)
     noise_model.add_all_qubit_quantum_error(error_2q, _TWO_QUBIT_GATES)
+
+    if p_readout > 0:
+        ro_probs = [[1 - p_readout, p_readout],
+                     [p_readout, 1 - p_readout]]
+        noise_model.add_all_qubit_readout_error(ReadoutError(ro_probs))
+
     return noise_model
 
 
@@ -171,6 +177,41 @@ def compute_unmitigated_expval(
         bit_k = int(bitstring[n_qubits - 1 - observable_qubit])
         z_k = 1 - 2 * bit_k  # 0 -> +1, 1 -> -1
         expval += count * z_k
+        total += count
+    return expval / total
+
+
+def compute_unmitigated_string_expval(
+    counts: dict[str, int],
+    observable_qubits: list[int],
+) -> float:
+    """Compute the unmitigated expectation value of a Z-string operator.
+
+    Evaluates ``<W> = <prod_{k in S} Z_k>`` from single-copy measurement
+    counts.  Each Z_k contributes +1 if qubit k measured 0, or -1 if
+    qubit k measured 1.  The product over the set S gives the per-shot
+    contribution.
+
+    Args:
+        counts: Qiskit counts dictionary from an N-qubit circuit.
+        observable_qubits: List of logical qubit indices defining the
+            Z-string operator ``W = prod_{k in observable_qubits} Z_k``.
+
+    Returns:
+        The raw (unmitigated) expectation value ``<W>``.
+    """
+    if not observable_qubits:
+        return 1.0  # empty product = identity operator
+
+    total = 0
+    expval = 0.0
+    for bitstring, count in counts.items():
+        n_qubits = len(bitstring)
+        w_shot = 1
+        for k in observable_qubits:
+            bit_k = int(bitstring[n_qubits - 1 - k])
+            w_shot *= 1 - 2 * bit_k  # 0 -> +1, 1 -> -1
+        expval += count * w_shot
         total += count
     return expval / total
 
@@ -266,3 +307,236 @@ def compute_mitigated_expval(
         return float("nan"), mean_num, mean_den
 
     return mean_num / mean_den, mean_num, mean_den
+
+
+def compute_mitigated_string_expval(
+    counts: dict[str, int],
+    observable_qubits: list[int],
+    n_qubits: int | None = None,
+) -> tuple[float, float, float]:
+    """Compute mitigated expectation value of a Z-string operator via M=2 VD.
+
+    For string operator ``W = prod_{k in S} Z_k``, the per-shot estimator
+    generalises the single-qubit formula (see
+    :func:`compute_mitigated_expval`).
+
+    Per-shot formulas for the multi-qubit case::
+
+        SWAP eigenvalue for pair j:
+            s_j = -1   if b1[j] == 0 and b2[j] == 1
+            s_j = +1   otherwise
+
+        Denominator (estimates Tr(rho^2)):
+            D_shot = prod_j  s_j
+
+        Observable factor for each k in S:
+            obs_k = 1 - b1[k] - b2[k]   (+1 / 0 / -1)
+
+        Numerator (estimates Tr(W rho^2)):
+            E_shot = (prod_{k in S} obs_k) * D_shot / (prod_{k in S} s_k)
+
+    When any ``obs_k == 0`` the shot contributes nothing to the numerator
+    (the two copies disagree on qubit k).
+
+    Args:
+        counts: Qiskit counts dictionary from the 2N-qubit M=2 circuit.
+        observable_qubits: List of logical qubit indices defining the
+            Z-string operator ``W = prod_k Z_k``.
+        n_qubits: Number of logical qubits *N*.  Inferred from the bit
+            string length (``len / 2``) when not provided.
+
+    Returns:
+        ``(mitigated_value, mean_numerator, mean_denominator)``.  Returns
+        ``(nan, ...)`` if the denominator is effectively zero.
+    """
+    if not observable_qubits:
+        # Empty product → identity operator: Tr(I * rho^2) / Tr(rho^2) = 1
+        return 1.0, 1.0, 1.0
+
+    numerator_sum = 0.0
+    denominator_sum = 0.0
+    total_shots = 0
+
+    for bitstring, count in counts.items():
+        n = n_qubits if n_qubits is not None else len(bitstring) // 2
+
+        # Bit extraction (Qiskit big-endian convention)
+        d_shot = 1
+        s_values = [0] * n
+        for j in range(n):
+            b1_j = int(bitstring[2 * n - 1 - j])
+            b2_j = int(bitstring[n - 1 - j])
+            s_j = -1 if (b1_j == 0 and b2_j == 1) else 1
+            s_values[j] = s_j
+            d_shot *= s_j
+
+        # Observable factors for each qubit in the string
+        obs_product = 1
+        s_product = 1
+        zero_obs = False
+        for k in observable_qubits:
+            b1_k = int(bitstring[2 * n - 1 - k])
+            b2_k = int(bitstring[n - 1 - k])
+            obs_k = 1 - b1_k - b2_k
+            if obs_k == 0:
+                zero_obs = True
+                break
+            obs_product *= obs_k
+            s_product *= s_values[k]
+
+        if zero_obs:
+            e_shot = 0.0
+        else:
+            e_shot = obs_product * d_shot / s_product
+
+        numerator_sum += e_shot * count
+        denominator_sum += d_shot * count
+        total_shots += count
+
+    mean_num = numerator_sum / total_shots
+    mean_den = denominator_sum / total_shots
+
+    if abs(mean_den) < 1e-15:
+        return float("nan"), mean_num, mean_den
+
+    return mean_num / mean_den, mean_num, mean_den
+
+
+# ---------------------------------------------------------------------------
+# Readout error mitigation
+# ---------------------------------------------------------------------------
+
+def mitigate_readout_counts(
+    counts: dict[str, int | float],
+    p_readout: float,
+) -> dict[str, float]:
+    """Correct measurement counts for symmetric readout errors.
+
+    Applies per-qubit inverse confusion matrix to undo symmetric bit-flip
+    readout noise.  For symmetric error probability *p*, each qubit's 2x2
+    confusion matrix and its inverse are::
+
+        C   = [[1-p,  p ],      C^{-1} = (1/(1-2p)) * [[1-p, -p ],
+               [ p, 1-p]]                               [-p,  1-p]]
+
+    The full N-qubit correction is the tensor product
+    ``C_1^{-1} x ... x C_N^{-1}``, applied one qubit at a time by pairing
+    bitstrings that differ only at that position.
+
+    Returns a quasi-probability dict (values may be negative) suitable for
+    feeding into ``compute_mitigated_expval()`` or
+    ``compute_unmitigated_expval()``.
+
+    Args:
+        counts: Qiskit counts dictionary (or quasi-probability dict from a
+            previous correction step).
+        p_readout: The symmetric readout error probability that was used
+            during simulation.  Must be in [0, 0.5).
+
+    Returns:
+        A dictionary mapping bitstrings to corrected quasi-probabilities.
+    """
+    if p_readout <= 0:
+        return dict(counts)
+
+    gamma = 1.0 / (1 - 2 * p_readout)
+    a = gamma * (1 - p_readout)   # diagonal element of C^{-1}
+    b = gamma * (-p_readout)       # off-diagonal element of C^{-1}
+
+    # Determine bit width from first key
+    first_key = next(iter(counts))
+    n_bits = len(first_key)
+
+    corrected: dict[str, float] = dict(counts)
+
+    for bit_pos in range(n_bits):
+        new_corrected: dict[str, float] = {}
+        visited: set[str] = set()
+
+        for bs in corrected:
+            if bs in visited:
+                continue
+
+            # Build partner bitstring (flipped at bit_pos)
+            bs_list = list(bs)
+            bs_list[bit_pos] = '1' if bs_list[bit_pos] == '0' else '0'
+            partner = ''.join(bs_list)
+            visited.add(bs)
+            visited.add(partner)
+
+            val_bs = corrected.get(bs, 0.0)
+            val_partner = corrected.get(partner, 0.0)
+
+            new_corrected[bs] = a * val_bs + b * val_partner
+            new_corrected[partner] = b * val_bs + a * val_partner
+
+        corrected = new_corrected
+
+    return corrected
+
+
+# ---------------------------------------------------------------------------
+# Subsystem purity estimation
+# ---------------------------------------------------------------------------
+
+def compute_subsystem_purity(
+    counts: dict[str, int],
+    subsystem: list[int],
+    n_qubits: int,
+) -> float:
+    """Estimate Tr(ρ_A²) from M=2 counts with B^(2) applied only to subsystem A.
+
+    When the B^(2) beamsplitter is applied only to qubit pairs (j, N+j) for
+    j ∈ A, the per-shot SWAP eigenvalue product restricted to A gives an
+    unbiased estimator of the subsystem purity::
+
+        d_shot = prod_{j in A} s_j
+
+    where ``s_j = -1`` if ``(b1[j]==0 and b2[j]==1)`` else ``+1``.
+
+    Args:
+        counts: Qiskit counts dict from a 2N-qubit circuit.
+        subsystem: Qubit indices defining subsystem A.
+        n_qubits: Number of logical qubits N.
+
+    Returns:
+        Estimated Tr(ρ_A²).
+    """
+    denominator_sum = 0.0
+    total_shots = 0
+
+    for bitstring, count in counts.items():
+        n = n_qubits
+        d_shot = 1
+        for j in subsystem:
+            b1_j = int(bitstring[2 * n - 1 - j])
+            b2_j = int(bitstring[n - 1 - j])
+            s_j = -1 if (b1_j == 0 and b2_j == 1) else 1
+            d_shot *= s_j
+
+        denominator_sum += d_shot * count
+        total_shots += count
+
+    return denominator_sum / total_shots
+
+
+def compute_renyi_entropy(
+    counts: dict[str, int],
+    subsystem: list[int],
+    n_qubits: int,
+) -> tuple[float, float]:
+    """Compute S_2(A) = -log₂(Tr(ρ_A²)) from M=2 counts.
+
+    Args:
+        counts: Qiskit counts dict from a 2N-qubit circuit.
+        subsystem: Qubit indices defining subsystem A.
+        n_qubits: Number of logical qubits N.
+
+    Returns:
+        ``(s2, tr_rho_a_sq)`` tuple.
+    """
+    tr_rho_a_sq = compute_subsystem_purity(counts, subsystem, n_qubits)
+    if tr_rho_a_sq <= 0:
+        return float("nan"), tr_rho_a_sq
+    s2 = -np.log2(tr_rho_a_sq)
+    return s2, tr_rho_a_sq

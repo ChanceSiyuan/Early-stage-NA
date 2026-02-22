@@ -1,13 +1,19 @@
 [project]
 name = "early-stage-na"
-version = "0.1.0"
+version = "0.2.0"
 description = "M=2 Virtual Distillation / Error Suppression by Derangement simulation"
 requires-python = ">=3.10"
 dependencies = [
     "qiskit>=1.0,<3.0",
     "qiskit-aer>=0.15",
     "numpy",
+    "pulser>=1.0",
+    "pulser-simulation>=1.0",
+    "bloqade>=0.15",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src"]
